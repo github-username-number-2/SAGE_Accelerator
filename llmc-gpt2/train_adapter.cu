@@ -355,9 +355,9 @@ typedef struct
     int *workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4 *bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
 
-    int use_adapters; // 0/1
-    int adapter_dim;  // rank r
-    int freeze_base;  // 1 => don't update base weights
+    int use_adapters; 
+    int adapter_dim;  
+    int freeze_base;  
     AdapterParams adapter;
     AdapterGrads adapter_grads;
     AdapterActs adapter_acts;
@@ -410,9 +410,9 @@ static void allocate_adapters(GPT2 *model, int B, int T)
     int L = model->config.num_layers;
     int C = model->config.channels;
     int r = model->adapter_dim;
-    size_t ne_down_w = (size_t)L * r * C;
+    size_t ne_down_w = (size_t)L * C * r;
     size_t ne_down_b = (size_t)L * r;
-    size_t ne_up_w = (size_t)L * C * r;
+    size_t ne_up_w = (size_t)L * r * C;
     size_t ne_up_b = (size_t)L * C;
     model->adapter_param_elems = ne_down_w + ne_down_b + ne_up_w + ne_up_b;
     size_t bytes = model->adapter_param_elems * sizeof(floatX);
@@ -443,14 +443,20 @@ static void allocate_adapters(GPT2 *model, int B, int T)
     cudaCheck(cudaMalloc(&model->adapter_acts_mem, ne_h * sizeof(floatX)));
     model->adapter_acts.h = (floatX *)model->adapter_acts_mem;
 
-    // init: down_w ~ N(0,0.02), others zero
     {
-        float *tmp = (float *)mallocCheck(ne_down_w * sizeof(float));
+        floatX *tmp_down = (floatX *)mallocCheck(ne_down_w * sizeof(floatX));
+        float *tmp_down_f32 = (float *)mallocCheck(ne_down_w * sizeof(float));
         mt19937_state rng;
         manual_seed(&rng, 123);
-        normal_(tmp, ne_down_w, 0.0f, 0.02f, &rng);
-        cudaCheck(cudaMemcpy(model->adapter.down_w, tmp, ne_down_w * sizeof(float), cudaMemcpyHostToDevice));
-        free(tmp);
+        normal_(tmp_down_f32, ne_down_w, 0.0f, 0.02f, &rng);
+        // Convert float to floatX
+        for (size_t i = 0; i < ne_down_w; i++) {
+            tmp_down[i] = (floatX)tmp_down_f32[i];
+        }
+        cudaCheck(cudaMemcpy(model->adapter.down_w, tmp_down, ne_down_w * sizeof(floatX), cudaMemcpyHostToDevice));
+        free(tmp_down_f32);
+        free(tmp_down);
+
         cudaCheck(cudaMemset(model->adapter.down_b, 0, ne_down_b * sizeof(floatX)));
         cudaCheck(cudaMemset(model->adapter.up_w, 0, ne_up_w * sizeof(floatX)));
         cudaCheck(cudaMemset(model->adapter.up_b, 0, ne_up_b * sizeof(floatX)));
@@ -699,21 +705,23 @@ void gpt2_set_hyperparameters(GPT2Config *config, const char *depth_str)
     config->num_heads = num_heads;
     config->max_seq_len = 1024;
 }
-static void adapter_forward_add(
-    floatX *x_btc, // (B,T,C) in-place
-    floatX *h_btr, // (B,T,r) post-GELU
-    floatX *scratch_btc,
+void adapter_forward_add(
+    floatX *out_btc, // (B,T,C) output, added to existing value
+    floatX *in_btc,  // (B,T,C) input
+    floatX *h_btr, // (B,T,r) scratch
+    floatX *scratch_btc, // (B,T,C) scratch
     floatX *down_w, floatX *down_b,
     floatX *up_w, floatX *up_b,
     int B, int T, int C, int r)
 {
+    // printf0("adapter_forward_add B=%d T=%d C=%d r=%d\n", B, T, C, r);
     // Down: (B,T,C)->(B,T,r)
-    matmul_forward_cublaslt(h_btr, x_btc, down_w, down_b, B, T, C, r, main_stream);
+    matmul_forward_cublaslt(h_btr, in_btc, down_w, down_b, B, T, C, r, main_stream);
     gelu_forward(h_btr, h_btr, B * T * r, main_stream);
     // Up: (B,T,r)->scratch (B,T,C)
     matmul_forward_cublaslt(scratch_btc, h_btr, up_w, up_b, B, T, r, C, main_stream);
-    // x += scratch
-    residual_forward(x_btc, x_btc, scratch_btc, B * T * C, main_stream);
+    // out += scratch
+    residual_forward(out_btc, out_btc, scratch_btc, B * T * C, main_stream);
 }
 void gpt3_set_hyperparameters(GPT2Config *config, const char *channels_str)
 {
@@ -879,6 +887,15 @@ void gpt_build_from_descriptor(GPT2 *model, const char *descriptor)
     free(params_memory_cpu);
 }
 
+__global__ void print_adapter_params(floatX *item, size_t n, char *hint)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+    {
+        printf("%s - %d: %f ", hint, idx, (float)item[idx]);
+    }
+}
+
 // propagate inputs through the network to produce logits.
 // right now, this function is fully synchronous with the host
 void gpt2_forward(GPT2 *model, const int *inputs, size_t B, size_t T)
@@ -972,21 +989,27 @@ void gpt2_forward(GPT2 *model, const int *inputs, size_t B, size_t T)
         matmul_forward_cublaslt(scratch, l_ln1, l_qkvw, l_qkvb, B, T, C, 3 * C, main_stream);
         attention_forward(l_atty, l_qkvr, l_att, scratch, B, T, C, NH, main_stream);
 #endif
-
         matmul_forward_cublaslt(scratch, l_atty, l_attprojw, l_attprojb, B, T, C, C, main_stream);
+        
+        // print_adapter_params<<<1,32>>>(scratch, 10, "sc1");
+        if (model->use_adapters)
+        {
+            // adapter. input is l_ln1, output is added to scratch
+            int r = model->adapter_dim;
+            floatX *h = model->adapter_acts.h + (size_t)l * B * T * r;
+            floatX *dw = model->adapter.down_w + (size_t)l * C * r;
+            floatX *db = model->adapter.down_b + (size_t)l * r;
+            floatX *uw = model->adapter.up_w + (size_t)l * r * C;
+            floatX *ub = model->adapter.up_b + (size_t)l * C;
+
+
+            adapter_forward_add(scratch, l_ln1, h, acts.scratch_btc, dw, db, uw, ub, B, T, C, r);
+        }
 
         if (model->use_adapters)
         {
             // residual add
             residual_forward(l_residual2, residual, scratch, B * T * C, main_stream);
-            // adapter
-            int r = model->adapter_dim;
-            floatX *h = model->adapter_acts.h + (size_t)l * B * T * r;
-            floatX *dw = model->adapter.down_w + (size_t)l * r * C;
-            floatX *db = model->adapter.down_b + (size_t)l * r;
-            floatX *uw = model->adapter.up_w + (size_t)l * C * r;
-            floatX *ub = model->adapter.up_b + (size_t)l * C;
-            adapter_forward_add(l_residual2, h, acts.scratch_btc, dw, db, uw, ub, B, T, C, r);
             layernorm_forward(l_ln2, l_ln2_mean, l_ln2_rstd, l_residual2, l_ln2w, l_ln2b, B, T, C, main_stream);
         }
         else
@@ -995,6 +1018,7 @@ void gpt2_forward(GPT2 *model, const int *inputs, size_t B, size_t T)
                                     residual, scratch, l_ln2w, l_ln2b, B * T, C, main_stream);
         }
 
+        // print_adapter_params<<<1,32>>>(scratch, 10, "sc2");
         matmul_forward_cublaslt(l_fch_gelu, l_ln2, l_fcw, l_fcb, B, T, C, 4 * C, main_stream, l_fch, model->gelu_fusion);
         matmul_forward_cublaslt(scratch, l_fch_gelu, l_fcprojw, l_fcprojb, B, T, 4 * C, C, main_stream);
         // OK, fusion across blocks.
@@ -1184,45 +1208,12 @@ void gpt2_backward_and_reduce(GPT2 *model, int *inputs, const int *targets, int 
         // layernorm backward does += to the dresidual, so it correctly accumulates grad from the MLP block above
         layernorm_backward(dresidual, dl_ln2w, dl_ln2b, scratchF, dl_btc, l_residual2, l_ln2w, l_ln2_mean, l_ln2_rstd, B, T, C, main_stream);
 
-        if (model->use_adapters)
-        {
-            int r = model->adapter_dim;
-            // Pointers
-            floatX *x = l_residual2;                                   // (B,T,C)
-            floatX *h = model->adapter_acts.h + (size_t)l * B * T * r; // post-GELU (we will recompute pre)
-            floatX *dw = model->adapter.down_w + (size_t)l * r * C;
-            floatX *db = model->adapter.down_b + (size_t)l * r;
-            floatX *uw = model->adapter.up_w + (size_t)l * C * r;
-            floatX *ub = model->adapter.up_b + (size_t)l * C;
+        // create a copy of the gradient that is flowing into the attention block
+        floatX* d_scratch = acts.scratch_btc;
+        cudaCheck(cudaMemcpyAsync(d_scratch, dresidual, B*T*C*sizeof(floatX), cudaMemcpyDeviceToDevice, main_stream));
 
-            floatX *g_dw = model->adapter_grads.down_w + (size_t)l * r * C;
-            floatX *g_db = model->adapter_grads.down_b + (size_t)l * r;
-            floatX *g_uw = model->adapter_grads.up_w + (size_t)l * C * r;
-            floatX *g_ub = model->adapter_grads.up_b + (size_t)l * C;
-
-            // We have dy in dresidual (grad wrt output y = x + f(x))
-            // Up backward: matmul h @ up_w -> f(x)
-            // Use dl_btc as temp for dh
-            matmul_backward(dl_btc, g_uw, g_ub, dresidual, h, (floatX *)uw, scratchF,
-                            B, T, r, C, main_stream);
-
-            // Recompute down pre-activation z into h (overwrite), then GELU backward
-            matmul_forward_cublaslt(h, x, dw, db, B, T, C, r, main_stream);
-            gelu_backward_inplace(dl_btc, h, B * T * r, main_stream); // dl_btc holds dh, becomes dz
-
-            // Down backward: dz -> grads & dx_adapter (reuse acts.scratch_bt4c first C slice)
-            // We'll store dx_adapter into acts.scratch_btc (scratch_btc reused earlier)
-            floatX *dx_adapter = acts.scratch_btc;
-            cudaCheck(cudaMemsetAsync(dx_adapter, 0, B * T * C * sizeof(floatX), main_stream));
-            matmul_backward(dx_adapter, g_dw, g_db, dl_btc, x, (floatX *)dw, scratchF,
-                            B, T, C, r, main_stream);
-
-            // Total gradient wrt x: dy + dx_adapter
-            residual_forward(dresidual, dresidual, dx_adapter, B * T * C, main_stream);
-        }
-
-        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, dresidual, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
-
+        // backward pass for the main attention path
+        matmul_backward(dl_btc, dl_attprojw, dl_attprojb, d_scratch, l_atty, l_attprojw, scratchF, B, T, C, C, main_stream);
 #ifdef ENABLE_CUDNN
         float *l_att = (float *)acts.att + l * B * NH * T; // cuDNN needs a smaller FP32 tensor
         attention_backward_cudnn(dl_bt4c, dl_btc, l_qkvr, l_atty, (float *)l_att, B, T, NH, C, main_stream);
@@ -1233,12 +1224,55 @@ void gpt2_backward_and_reduce(GPT2 *model, int *inputs, const int *targets, int 
         floatX *buffer_b = l_fch_pre_gelu; // this is B x T x 4C, so even larger than what we need
         attention_backward(dl_bt4c, buffer_b, scratchX, buffer_a, dl_btc, l_qkvr, l_att, B, T, C, NH, main_stream);
 #endif
+
+        floatX* dx_main_path = dl_bt4c; // gradient w.r.t. x from the main attention path, stored in dl_bt4c
+
+        if (model->use_adapters)
+        {
+            int r = model->adapter_dim;
+            // Pointers for adapter weights and activations
+            floatX *x = l_ln1;
+            floatX *h = model->adapter_acts.h + (size_t)l * B * T * r;
+            floatX *dw = model->adapter.down_w + (size_t)l * C * r;
+            floatX *db = model->adapter.down_b + (size_t)l * r;
+            floatX *uw = model->adapter.up_w + (size_t)l * r * C;
+            floatX *ub = model->adapter.up_b + (size_t)l * C;
+
+            // Pointers for adapter gradients
+            floatX *g_dw = model->adapter_grads.down_w + (size_t)l * C * r;
+            floatX *g_db = model->adapter_grads.down_b + (size_t)l * r;
+            floatX *g_uw = model->adapter_grads.up_w + (size_t)l * r * C;
+            floatX *g_ub = model->adapter_grads.up_b + (size_t)l * C;
+
+            // Backprop through adapter
+            // 1. Backprop through up-projection
+            floatX* dh = dl_btc; // Reuse dl_btc as a temporary buffer for dh
+            matmul_backward(dh, g_uw, g_ub, d_scratch, h, uw, scratchF, B, T, r, C, main_stream);
+
+            // 2. Backprop through GELU
+            // We need to recompute the forward pass of the down-projection + GELU to get the pre-GELU activations
+            // Note: The forward pass for adapter was adapter_forward_add(scratch, l_ln1, h, acts.scratch_btc, dw, db, uw, ub, B, T, C, r);
+            // h was the result of gelu(matmul(l_ln1, dw) + db). We need the pre-gelu value.
+            // Let's recompute it.
+            floatX* h_pre_gelu = acts.scratch_btc; // Reuse another scratch buffer
+            matmul_forward_cublaslt(h_pre_gelu, x, dw, db, B, T, C, r, main_stream);
+            gelu_backward_inplace(dh, h_pre_gelu, B * T * r, main_stream); // dh now becomes dz
+
+            // 3. Backprop through down-projection
+            floatX *dx_adapter = d_scratch; // Use d_scratch as a buffer for the adapter's input gradient
+            cudaCheck(cudaMemsetAsync(dx_adapter, 0, B * T * C * sizeof(floatX), main_stream));
+            matmul_backward(dx_adapter, g_dw, g_db, dh, x, dw, scratchF, B, T, C, r, main_stream);
+
+            // 4. Add the gradient from the adapter path to the gradient from the main path
+            residual_forward(dx_main_path, dx_main_path, dx_adapter, B*T*C, main_stream);
+        }
+
         if (model->recompute >= 2)
         {
             layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C, main_stream);
         }
-        // QKV parameter gradients
-        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dl_bt4c, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
+        // QKV parameter gradients (input is now the combined gradient from main and adapter paths)
+        matmul_backward(dl_btc, dl_qkvw, dl_qkvb, dx_main_path, l_ln1, l_qkvw, scratchF, B, T, C, 3 * C, main_stream);
         // layernorm backward does += to dresidual, so it correctly accumulates gradient for the Attention block above
         layernorm_backward(dresidual, dl_ln1w, dl_ln1b, scratchF, dl_btc, residual, l_ln1w, l_ln1_mean, l_ln1_rstd, B, T, C, main_stream);
 
@@ -1485,9 +1519,9 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
                          n, n, n, n, 1,
                          learning_rate, beta1, beta2, t, eps, wd, grad_scale, seed, main_stream);
         };
-        size_t ne_up_w = (size_t)L * C * r;
+        size_t ne_up_w = (size_t)L * r * C;
         size_t ne_up_b = (size_t)L * C;
-        size_t ne_down_w = (size_t)L * r * C;
+        size_t ne_down_w = (size_t)L * C * r;
         size_t ne_down_b = (size_t)L * r;
 
         upd(model->adapter.up_w, model->adapter_grads.up_w, ne_up_w, weight_decay);
@@ -1590,6 +1624,7 @@ void common_free(GPT2 &model)
     destroy_cudnn();
 #endif
 }
+
 
 void save_state(const char *filename, int step, GPT2 *model, DataLoader *loader)
 {
@@ -1706,7 +1741,93 @@ void load_state(int *step, GPT2 *model, DataLoader *loader, const char *filename
     // all done, close state file
     fcloseCheck(state_file);
 }
+void save_adapter(const char *filename, GPT2 *model, int B, int L, int C, int r, int T)
+{
+    printf0("Writing adapter parameters to %s\n", filename);
+    FILE *adapter_file = fopenCheck(filename, "w");
+    fwriteCheck(&B, sizeof(int), 1, adapter_file);
+    fwriteCheck(&L, sizeof(int), 1, adapter_file);
+    fwriteCheck(&C, sizeof(int), 1, adapter_file);
+    fwriteCheck(&r, sizeof(int), 1, adapter_file);
+    fwriteCheck(&T, sizeof(int), 1, adapter_file);
+    size_t nelements = (size_t)L * C * r;
+    device_to_file(adapter_file, model->adapter.down_w, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    nelements = (size_t)L * r;
+    device_to_file(adapter_file, model->adapter.down_b, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    nelements = (size_t)L * r * C;
+    device_to_file(adapter_file, model->adapter.up_w, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    nelements = (size_t)L * C;
+    device_to_file(adapter_file, model->adapter.up_b, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
 
+    // nelements = (size_t)L * C * r;
+    // device_to_file(adapter_file, model->adapter_grads.down_w, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    // nelements = (size_t)L * r;
+    // device_to_file(adapter_file, model->adapter_grads.down_b, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    // nelements = (size_t)L * r * C;
+    // device_to_file(adapter_file, model->adapter_grads.up_w, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    // nelements = (size_t)L * C;
+    // device_to_file(adapter_file, model->adapter_grads.up_b, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    
+    // nelements = (size_t)B * L * T * r;
+    // device_to_file(adapter_file, model->adapter_acts.h, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+
+    // printf0("Saved adapter\n");
+    // print_adapter_params<<<1, 32>>>(model->adapter_acts.h, 10, "h");
+    // print_adapter_params<<<1, 32>>>(model->adapter.down_w, 10, "down_w");
+    // print_adapter_params<<<1, 32>>>(model->adapter.down_b, 10, "down_b");
+    // print_adapter_params<<<1, 32>>>(model->adapter.up_w, 10, "up_w");
+    // print_adapter_params<<<1, 32>>>(model->adapter.up_b, 10, "up_b");
+    // print_adapter_params<<<1, 32>>>(model->adapter_grads.down_w, 10, "down_w_grad");
+    // print_adapter_params<<<1, 32>>>(model->adapter_grads.down_b, 10, "down_b_grad");
+    // print_adapter_params<<<1, 32>>>(model->adapter_grads.up_w, 10, "up_w_grad");
+    // print_adapter_params<<<1, 32>>>(model->adapter_grads.up_b, 10, "up_b_grad");
+    // cudaCheck(cudaStreamSynchronize(main_stream));
+    fcloseCheck(adapter_file);
+}
+
+void load_adapter(const char *filename, GPT2 *model, int *B, int *L, int *C, int *r, int *T)
+{
+    FILE *adapter_file = fopenCheck(filename, "r");
+    freadCheck(B, sizeof(int), 1, adapter_file);
+    freadCheck(L, sizeof(int), 1, adapter_file);
+    freadCheck(C, sizeof(int), 1, adapter_file);
+    freadCheck(r, sizeof(int), 1, adapter_file);
+    freadCheck(T, sizeof(int), 1, adapter_file);
+    model->adapter_dim = *r;
+    size_t nelements = (size_t)(*L) * (*C) * (*r);
+
+    file_to_device(model->adapter.down_w, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    nelements = (size_t)(*L) * (*r);
+    file_to_device(model->adapter.down_b, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    nelements = (size_t)(*L) * (*r) * (*C);
+    file_to_device(model->adapter.up_w, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    nelements = (size_t)(*L) * (*C);
+    file_to_device(model->adapter.up_b, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    // nelements = (size_t)(*L) * (*C) * (*r);
+    // file_to_device(model->adapter_grads.down_w, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    // nelements = (size_t)(*L) * (*r);
+    // file_to_device(model->adapter_grads.down_b, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    // nelements = (size_t)(*L) * (*r) * (*C);
+    // file_to_device(model->adapter_grads.up_w, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    // nelements = (size_t)(*L) * (*C);
+    // file_to_device(model->adapter_grads.up_b, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    // nelements = (size_t)(*B) * (*L) * (*T) * (*r);
+    // file_to_device(model->adapter_acts.h, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
+    cudaCheck(cudaStreamSynchronize(main_stream));
+
+    // printf0("Loaded adapter\n");
+    // print_adapter_params<<<1, 32>>>(model->adapter_acts.h, 10, "h");
+    // print_adapter_params<<<1, 32>>>(model->adapter.down_w, 10, "down_w");
+    // print_adapter_params<<<1, 32>>>(model->adapter.down_b, 10, "down_b");
+    // print_adapter_params<<<1, 32>>>(model->adapter.up_w, 10, "up_w");
+    // print_adapter_params<<<1, 32>>>(model->adapter.up_b, 10, "up_b");
+    // print_adapter_params<<<1, 32>>>(model->adapter_grads.down_w, 10, "down_w_grad");
+    // print_adapter_params<<<1, 32>>>(model->adapter_grads.down_b, 10, "down_b_grad");
+    // print_adapter_params<<<1, 32>>>(model->adapter_grads.up_w, 10, "up_w_grad");
+    // print_adapter_params<<<1, 32>>>(model->adapter_grads.up_b, 10, "up_b_grad");
+    // cudaCheck(cudaStreamSynchronize(main_stream));
+    fcloseCheck(adapter_file);
+}
 void write_checkpoint(const char *output_log_dir, int step, GPT2 *model, DataLoader *train_loader, MultiGpuConfig *multi_gpu_config)
 {
     // a checkpoint contains: model weights, optimizer/dataloader state, and a DONE file
@@ -1728,6 +1849,14 @@ void write_checkpoint(const char *output_log_dir, int step, GPT2 *model, DataLoa
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/DONE_%08d", output_log_dir, step);
         FILE *done_file = fopenCheck(filename_buffer, "w");
         fcloseCheck(done_file);
+    }
+    if (rank == 0 && model->use_adapters)
+    {
+        snprintf(filename_buffer, sizeof(filename_buffer), "%s/adapter_params_%08d.bin", output_log_dir, step);
+        size_t L = model->config.num_layers;
+        size_t C = model->config.channels;
+        size_t r = model->adapter_dim;
+        save_adapter(filename_buffer, model, model->batch_size, L, C, r, model->seq_len);
     }
 }
 
@@ -1812,8 +1941,7 @@ void error_usage()
     fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
     fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
     fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
-        
-    
+
     fprintf(stderr, "  -Ar <int>   use adapters 0/1 (default 0)\n");
     fprintf(stderr, "  -Ad <int>   adapter rank (default 32)\n");
     fprintf(stderr, "  -Af <int>   freeze base weights if adapters (0/1 default 1)\n");
@@ -1867,6 +1995,8 @@ int main(int argc, char *argv[])
     int use_adapters = 0;
     int adapter_dim = 32;
     int adapter_freeze = 1;
+    bool init_from_file = false;
+    char *adapter_load_filename = nullptr;
 
     for (int i = 1; i < argc; i += 2)
     {
@@ -2042,6 +2172,11 @@ int main(int argc, char *argv[])
         else if (argv[i][1] == 'A' && argv[i][2] == 'f')
         {
             adapter_freeze = atoi(argv[i + 1]);
+        }
+        else if (argv[i][1] == 'A' && argv[i][2] == 'e')
+        {
+            adapter_load_filename = argv[i + 1];
+            init_from_file = true;
         }
         else
         {
@@ -2253,9 +2388,20 @@ int main(int argc, char *argv[])
     // if we found a checkpoint to resume from, load the optimization state
     int step = 0;
     gpt2_allocate_state(&model, B, T);
+    int adapter_load_B = 0, adapter_load_L = 0, adapter_load_C = 0, adapter_load_r = 0, adapter_load_T = 0;
     if (model.use_adapters)
     {
         allocate_adapters(&model, B, T);
+        if(init_from_file)
+        {
+            if (adapter_load_filename == nullptr)
+            {
+                fprintf(stderr, "Error: adapter_load_filename is null but init_from_file is true\n");
+                exit(EXIT_FAILURE);
+            }
+            load_adapter(adapter_load_filename, &model, &adapter_load_B, &adapter_load_L, &adapter_load_C, &adapter_load_r, &adapter_load_T);
+            printf0("loaded adapters from %s, B=%d, L=%d, C=%d, r=%d, T=%d\n", adapter_load_filename, adapter_load_B, adapter_load_L, adapter_load_C, adapter_load_r, adapter_load_T);
+        }
     }
     if (resuming == 1)
     {
