@@ -1,3 +1,17 @@
+# November 21, 2025
+
+Added cu file that can do sampling from the llm.c with/without using adapter. It has 3 command line arguments.
+1. <model_weights.bin> : relative filepath to the saved pretrained model weights bin file. 
+2. <adapter_weights.bin> : relative filepath to the saved adapter weights bin file. 
+3. <Use adapter (1 / 0)> : 0 for no adapter, 1 to use adapter. 
+
+```bash
+make gpt2_generation
+
+./gpt2_generation <model_weights.bin> <adapter_weights.bin> <Use adapter(1/0)>
+
+```
+
 # llm.c
 
 LLMs in simple, pure C/CUDA with no need for 245MB of PyTorch or 107MB of cPython. Current focus is on pretraining, in particular reproducing the [GPT-2](https://github.com/openai/gpt-2) and [GPT-3](https://arxiv.org/abs/2005.14165) miniseries, along with a parallel PyTorch reference implementation in [train_gpt2.py](train_gpt2.py). You'll recognize this file as a slightly tweaked [nanoGPT](https://github.com/karpathy/nanoGPT), an earlier project of mine. Currently, llm.c is a bit faster than PyTorch Nightly (by about 7%). In addition to the bleeding edge mainline code in [train_gpt2.cu](train_gpt2.cu), we have a simple reference CPU fp32 implementation in ~1,000 lines of clean code in one file [train_gpt2.c](train_gpt2.c). I'd like this repo to only maintain C and CUDA code. Ports to other languages or repos are very welcome, but should be done in separate repos, and I am happy to link to them below in the "notable forks" section. Developer coordination happens in the [Discussions](https://github.com/karpathy/llm.c/discussions) and on Discord, either the `#llmc` channel on the [Zero to Hero](https://discord.gg/3zy8kqD9Cp) channel, or on `#llmdotc` on [GPU MODE](https://discord.gg/gpumode) Discord.
