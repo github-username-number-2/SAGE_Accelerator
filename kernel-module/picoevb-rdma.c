@@ -39,6 +39,13 @@
 #define BAR_GPIO	0
 #define BAR_DMA		1
 
+
+#define ADDER_BASE      0x00000100
+#define ADDER_REG_A     0x00
+#define ADDER_REG_B     0x04
+#define ADDER_REG_RESULT        0x08
+
+
 #ifdef NV_BUILD_DGPU
 #define GPU_PAGE_SHIFT	16
 #else
@@ -223,6 +230,63 @@ static int pevb_ioctl_led(struct pevb_file *pevb_file, unsigned long arg)
 	pevb_writel(pevb, BAR_GPIO, arg, 0);
 	return 0;
 }
+
+static int pevb_ioctl_adder(struct pevb_file *pevb_file, unsigned long arg){
+
+        struct pevb *pevb = pevb_file->pevb;
+                struct pci_dev *pdev = pevb->pdev;
+        void __user *argp = (void __user *)arg;
+        struct picoevb_rdma_adder adder_params;
+
+        u32 ra, rb, rr, rc; // test
+        u32 reg;
+
+        if (copy_from_user(&adder_params, argp, sizeof(adder_params)))
+                return -EFAULT;
+
+        pr_info("write A start\n");
+        reg = ADDER_BASE + 0x00;
+        pevb_writel(pevb, BAR_GPIO, adder_params.a,reg);
+
+        pr_info("write B start\n");
+        reg = ADDER_BASE + 0x04;
+        pevb_writel(pevb, BAR_GPIO, adder_params.b, reg);
+        reg = ADDER_BASE + 0x0C;
+        pevb_writel(pevb, BAR_GPIO, 0x12345678, reg);
+
+        wmb();
+
+        //reg = ADDER_BASE + 0x08;
+        //adder_params.result = pevb_readl(pevb, BAR_GPIO,reg);
+
+        pr_info("read A start\n");
+        reg = ADDER_BASE + 0x00;
+        ra = pevb_readl(pevb, BAR_GPIO, reg);
+        reg = ADDER_BASE + 0x04;
+        rb = pevb_readl(pevb, BAR_GPIO, reg);
+        reg = ADDER_BASE + 0x08;
+        rr = pevb_readl(pevb, BAR_GPIO, reg);
+        reg = ADDER_BASE + 0x0c;
+        rc = pevb_readl(pevb, BAR_GPIO, reg);
+
+        adder_params.result = rr; // return to user paramters
+
+        pr_info("BAR_GPIO=%d ADDER_BASE=0x%x\n", BAR_GPIO, ADDER_BASE);
+
+        pr_info("BAR0 start=%pa len=0x%llx\n", &pdev->resource[0].start, (unsigned long long)pci_resource_len(pdev, 0));
+
+        pr_info("BAR1 start=%pa len=0x%llx\n",&pdev->resource[1].start,  (unsigned long long)pci_resource_len(pdev, 1));
+
+
+        pr_info("picoevb adder: A=0x%08x readA=0x%08x B=0x%08x readB=0x%08x result=0x%08x ctrl=0x%08x\n",
+                adder_params.a, ra, adder_params.b, rb, rr,rc);
+        if (copy_to_user(argp, &adder_params, sizeof(adder_params)))
+                return -EFAULT;
+
+        return 0;
+
+}
+
 
 #ifndef NV_BUILD_NO_CUDA
 static int pevb_ioctl_pin_cuda(struct pevb_file *pevb_file, unsigned long arg)
