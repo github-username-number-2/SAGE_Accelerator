@@ -73,13 +73,19 @@ struct picoevb_rdma_c2h_dma {
 	__u64 dma_time_ns;
 };
 #define PICOEVB_C2H_DMA_FLAG_DST_IS_CUDA (1 << 0)
+struct picoevb_rdma_adder {
+        __u32 a;
+        __u32 b;
+        __u32 result;
 
-#define PICOEVB_IOC_LED		_IOW('P', 0, __u32)
-#define PICOEVB_IOC_PIN_CUDA	_IOWR('P', 1, struct picoevb_rdma_pin_cuda)
-#define PICOEVB_IOC_UNPIN_CUDA	_IOW('P', 2, struct picoevb_rdma_unpin_cuda)
-#define PICOEVB_IOC_H2C2H_DMA	_IOWR('P', 3, struct picoevb_rdma_h2c2h_dma)
-#define PICOEVB_IOC_CARD_INFO	_IOR('P', 4, struct picoevb_rdma_card_info)
-#define PICOEVB_IOC_H2C_DMA	_IOWR('P', 5, struct picoevb_rdma_h2c_dma)
-#define PICOEVB_IOC_C2H_DMA	_IOWR('P', 6, struct picoevb_rdma_c2h_dma)
+};
 
+#define PICOEVB_IOC_LED         _IOW('P', 0, __u32)
+#define PICOEVB_IOC_PIN_CUDA    _IOWR('P', 1, struct picoevb_rdma_pin_cuda)
+#define PICOEVB_IOC_UNPIN_CUDA  _IOW('P', 2, struct picoevb_rdma_unpin_cuda)
+#define PICOEVB_IOC_H2C2H_DMA   _IOWR('P', 3, struct picoevb_rdma_h2c2h_dma)
+#define PICOEVB_IOC_CARD_INFO   _IOR('P', 4, struct picoevb_rdma_card_info)
+#define PICOEVB_IOC_H2C_DMA     _IOWR('P', 5, struct picoevb_rdma_h2c_dma)
+#define PICOEVB_IOC_C2H_DMA     _IOWR('P', 6, struct picoevb_rdma_c2h_dma)
+#define PICOEVB_IOC_ADDER       _IOWR('P',7, struct picoevb_rdma_adder)
 #endif
