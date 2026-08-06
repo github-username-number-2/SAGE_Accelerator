@@ -218,10 +218,10 @@ int cudaMallocConditionallyManaged(void** out, size_t bytes, const char *file, i
         cudaGetLastError(); // reset the error before the next API call
         cudaCheck_(cudaMallocManaged(out, bytes), file, line);
         cudaMemLocation loc = {};
-        loc.type = cudaMemLocationTypeHost;
-        loc.id = cudaCpuDeviceId;
-        // cudaCheck_(cudaMemAdvise(*out, bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId), file, line);
-        cudaCheck_(cudaMemAdvise(*out, bytes, cudaMemAdviseSetPreferredLocation, loc), file, line);
+        // loc.type = cudaMemLocationTypeHost;
+        // loc.id = cudaCpuDeviceId;
+        cudaCheck_(cudaMemAdvise(*out, bytes, cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId), file, line);
+        // cudaCheck_(cudaMemAdvise(*out, bytes, cudaMemAdviseSetPreferredLocation, loc), file, line);
         return 1;
     } else {
         cudaCheck_(err, file, line);
