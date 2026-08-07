@@ -603,17 +603,29 @@ static void allocate_adapters(GPT2 *model, int B, int T)
             (double)bytes / 1024.0 / 1024.0);
 }
 
-
-void load_adapter(const char *filename, GPT2 *model, int *B, int *L, int *C, int *r, int *T)
+void read_adapter_header(const char *filename, GPT2 *model, int *B, int *L, int *C, int *r, int *T)
 {
-    FILE *adapter_file = fopenCheck(filename, "r");
+    FILE *adapter_file = fopenCheck(filename, "rb");
     freadCheck(B, sizeof(int), 1, adapter_file);
     freadCheck(L, sizeof(int), 1, adapter_file);
     freadCheck(C, sizeof(int), 1, adapter_file);
     freadCheck(r, sizeof(int), 1, adapter_file);
     freadCheck(T, sizeof(int), 1, adapter_file);
     model->adapter_dim = *r;
+    fcloseCheck(adapter_file);
+}
+
+void load_adapter(const char *filename, GPT2 *model, int *B, int *L, int *C, int *r, int *T)
+{
+    FILE *adapter_file = fopenCheck(filename, "rb");
+    freadCheck(B, sizeof(int), 1, adapter_file);
+    freadCheck(L, sizeof(int), 1, adapter_file);
+    freadCheck(C, sizeof(int), 1, adapter_file);
+    freadCheck(r, sizeof(int), 1, adapter_file);
+    freadCheck(T, sizeof(int), 1, adapter_file);
+    // model->adapter_dim = *r;
     size_t nelements = (size_t)(*L) * (*C) * (*r);
+    printf("Inside load_adapter: B=%d, L=%d, C=%d, r=%d, T=%d\n", *B, *L, *C, *r, *T);
 
     file_to_device(model->adapter.down_w, adapter_file, nelements * sizeof(floatX), IO_BUF_SIZE, main_stream);
     nelements = (size_t)(*L) * (*r);
@@ -659,6 +671,7 @@ void adapter_forward_add(
     // printf0("adapter_forward_add B=%d T=%d C=%d r=%d\n", B, T, C, r);
     // Down: (B,T,C)->(B,T,r)
     matmul_forward_cublaslt(h_btr, in_btc, down_w, down_b, B, T, C, r, main_stream);
+    printf("inside adapter_forward_add: B=%d T=%d C=%d r=%d\n", B, T, C, r);
     gelu_forward(h_btr, h_btr, B * T * r, main_stream);
     // Up: (B,T,r)->scratch (B,T,C)
     matmul_forward_cublaslt(scratch_btc, h_btr, up_w, up_b, B, T, r, C, main_stream);
@@ -763,7 +776,7 @@ void gpt2_forward(GPT2 *model, const int *inputs, size_t B, size_t T)
         {
             // adapter. input is l_ln1, output is added to scratch
             int r = model->adapter_dim;
-            floatX *h = model->adapter_acts.h + (size_t)l * B * T * r;
+            floatX *h = model->adapter_acts.h + (size_t)l * B * model->seq_len * r;
             floatX *dw = model->adapter.down_w + (size_t)l * C * r;
             floatX *db = model->adapter.down_b + (size_t)l * r;
             floatX *uw = model->adapter.up_w + (size_t)l * r * C;
@@ -825,7 +838,7 @@ int main(int argc, char *argv[]) {
     const char *model_path = "model.bin";
     const char *adapter_path = "adapter_params.bin";
     int genT = 64;
-    int B = 1;
+    int B = 16;
     int T = 1024;
 
     for (int i = 1; i < argc; i += 2) {
@@ -843,10 +856,14 @@ int main(int argc, char *argv[]) {
     gpt2_build_from_checkpoint(&model, model_path);
 
     model.use_adapters = 1;
-    gpt2_allocate_state(&model, B, T);
 
-    allocate_adapters(&model, B, T);
+    // allocate_adapters(&model, B, T);
+    // printf("Hello!\n");
     int a_B = 0, a_L = 0, a_C = 0, a_r = 0, a_T = 0;
+    read_adapter_header(adapter_path, &model, &a_B, &a_L, &a_C, &a_r, &a_T);
+
+    gpt2_allocate_state(&model, B, T);
+    allocate_adapters(&model, model.batch_size, model.seq_len);
     load_adapter(adapter_path, &model, &a_B, &a_L, &a_C, &a_r, &a_T);
     printf("Loaded adapters: dim=%d, layers=%d, channels=%d\n", a_r, a_L, a_C);
 
@@ -863,8 +880,8 @@ int main(int argc, char *argv[]) {
 
     printf("Generating tokens:\n---\n");
     for (int t = 1; t < genT; t++) {
-        int current_seq_len = CEIL_DIV(t, min(T, 256)) * min(T, 256);
-        gpt2_forward(&model, gen_tokens, 1, current_seq_len);
+        int current_seq_len = CEIL_DIV(t, 512) * 512;
+        gpt2_forward(&model, gen_tokens, B, current_seq_len);
 
         floatX *logits = model.acts.output + (t - 1) * model.config.padded_vocab_size;
         cudaCheck(cudaMemcpy(cpu_logits_raw, logits, model.config.vocab_size * sizeof(floatX), cudaMemcpyDeviceToHost));
