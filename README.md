@@ -1,3 +1,23 @@
+# Update
+
+llama.cpp directory contains the codes from llama.cpp project. llama.cpp/src/llama-graph.cpp contains the code to invoke lora module and currently holds the code to invoke adapter function as shown in the client-applications/ffn.c file. 
+
+Load the picoevb kernel module:
+
+```
+sudo insmod /lib/modules/$(uname -r)/kernel/drivers/nv-p2p/nvidia-p2p.ko
+cd ~/SAGE_Accelerator/jetson-rdma-picoevb/kernel-module
+sudo insmod ./picoevb-rdma.ko
+```
+
+check if the module is loaded correctly or not with 
+
+```
+lspci -v
+```
+
+You should see the following line in the output   `Kernel driver in use: picoevb-rdma`. This indicates that the RDMA module is setup properly. 
+
 # Introduction
 
 This repository provides a minimal hardware-based demonstration of GPUDirect
