@@ -1171,6 +1171,9 @@ static long pevb_fops_unlocked_ioctl(struct file *filep, unsigned int cmd,
 	struct pevb_file *pevb_file = filep->private_data;
 
 	switch (cmd) {
+		
+	case PICOEVB_IOC_ADDER:
+		return pevb_ioctl_adder(pevb_file, arg);
 	case PICOEVB_IOC_LED:
 		return pevb_ioctl_led(pevb_file, arg);
 #ifndef NV_BUILD_NO_CUDA
